@@ -108,6 +108,13 @@ def logged_evictions(path):
 
 def eviction_section(args):
     """Image/text conversations must keep their resident checkpoints."""
+    # Other suites may share the server log, so only evictions logged from here
+    # on belong to this section.
+    baseline = len(logged_evictions(args.log))
+
+    def new_evictions():
+        return logged_evictions(args.log)[baseline:]
+
     # A: long image conversation -- the expensive checkpoint that must survive.
     history = [{"role": "system", "content": "Answer briefly."},
                {"role": "user", "content": [
@@ -126,18 +133,21 @@ def eviction_section(args):
     alien = [{"role": "user", "content": "Reply with exactly ALIEN."}]
     alien1, cached, usage = chat(args, alien, "alien1")
     assert cached == 0, "alien1: an unrelated request reused a checkpoint"
-    assert not logged_evictions(args.log), \
+    assert not new_evictions(), \
         "an unrelated request evicted a checkpoint while empty slots existed"
-    continue_chat(args, alien, alien1, "alien1-again", "Reply with exactly ALIEN.",
-                  usage["total_tokens"])
+    _, _, alien_usage = continue_chat(args, alien, alien1, "alien1-again",
+                                      "Reply with exactly ALIEN.",
+                                      usage["total_tokens"])
+    alien_frontier = alien_usage["total_tokens"]
 
     a3, cached, usage = continue_chat(args, a2_messages, a2, "A3-image",
                                       "Reply with exactly STILL.", a2_frontier)
     a_frontier = usage["total_tokens"]
     a3_messages = a2_messages + [a2, {"role": "user", "content": "Reply with exactly STILL."}]
 
-    # Fill the remaining slots.  short0 is deliberately the smallest resident so
-    # the forced eviction below has an unambiguous victim.
+    # Fill the remaining slots.  The forced eviction below is unambiguous
+    # because the expected victim counts every fresh resident checkpoint,
+    # including the unrelated conversation above.
     short_frontiers = []
     for label, count in (("short0", 8), ("short1", 512)):
         messages = [{"role": "user",
@@ -147,15 +157,15 @@ def eviction_section(args):
         _, cached, usage = continue_chat(args, messages, answer, label + "-again",
                                         "Reply with exactly OK.", usage["total_tokens"])
         short_frontiers.append(usage["total_tokens"])
-    shortest = min(short_frontiers)
+    shortest = min(short_frontiers + [alien_frontier])
 
     # Every slot is occupied now: the next unrelated request must evict the
     # shortest fresh checkpoint, and the log must say so.
-    before = len(logged_evictions(args.log))
+    before = len(new_evictions())
     _, cached, _ = chat(args, [{"role": "user", "content": "Reply with exactly ALIEN2."}],
                         "alien2")
     assert cached == 0, "alien2: an unrelated request reused a checkpoint"
-    evictions = logged_evictions(args.log)
+    evictions = new_evictions()
     if args.log:
         print("  eviction victims: %s (shortest fresh=%d, image=%d)" % (
             evictions, shortest, a_frontier), flush=True)
@@ -175,8 +185,7 @@ def eviction_section(args):
     continue_chat(args, a3_messages, a3, "A4-image",
                   "Reply with exactly FINAL.", a_frontier)
     if args.log:
-        evictions = logged_evictions(args.log)
-        assert all(count < a_frontier for count in evictions), \
+        assert all(count < a_frontier for count in new_evictions()), \
             "a new image conversation evicted the resident image conversation"
     print("PASS: live-state routing kept image and text checkpoints resident", flush=True)
 
